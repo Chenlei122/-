@@ -8,8 +8,21 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout (force main)
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Debug git & files
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "GITHUB_REF_NAME=$GITHUB_REF_NAME"
+          echo "GITHUB_SHA=$GITHUB_SHA"
+          git log --oneline -n 5
+          echo "Repo root listing:"
+          ls -la
 
       - name: Setup Python
         uses: actions/setup-python@v5
