@@ -39,6 +39,17 @@ jobs:
           print("Wrote sa.json for project:", data.get("project_id"))
           PY
 
+      # ⭐ 先把兩支 .py 寫到工作目錄（把佔位文字換成真正程式碼）
+      - name: Write scripts from workflow (temp)
+        working-directory: ${{ github.workspace }}
+        run: |
+          cat > predict_and_advise.py <<'PY'
+          # <<< 在這裡貼你的「predict_and_advise.py」完整內容 >>>
+          PY
+          cat > firestore_predict_writeback.py <<'PY'
+          # <<< 在這裡貼我給你的「firestore_predict_writeback.py」完整內容 >>>
+          PY
+
       - name: Assert files exist
         working-directory: ${{ github.workspace }}
         shell: bash
