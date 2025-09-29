@@ -14,13 +14,14 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Debug git & files
+      - name: Debug git & files (before)
         working-directory: ${{ github.workspace }}
         run: |
-          echo "GITHUB_REF=$GITHUB_REF"
-          echo "GITHUB_REF_NAME=$GITHUB_REF_NAME"
-          echo "GITHUB_SHA=$GITHUB_SHA"
-          git log --oneline -n 5
+          echo "GITHUB_REPOSITORY=${GITHUB_REPOSITORY}"
+          echo "GITHUB_REF=${GITHUB_REF}"
+          echo "GITHUB_REF_NAME=${GITHUB_REF_NAME}"
+          echo "GITHUB_SHA=${GITHUB_SHA}"
+          git log --oneline -n 5 || true
           echo "Repo root listing:"
           ls -la
 
@@ -51,6 +52,42 @@ jobs:
           pathlib.Path("sa.json").write_text(raw, encoding="utf-8")
           print("Wrote sa.json for project:", data.get("project_id"))
           PY
+
+      # ⛑️ 若檔案缺少，直接從 repo main 抓原始檔回來
+      - name: Fallback download missing files from repo
+        working-directory: ${{ github.workspace }}
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          base="https://raw.githubusercontent.com/${REPO}/main"
+          need_fetch=0
+
+          for f in "firestore_predict_writeback.py" "predict_and_advise.py" "behavior_health_model.zip" "behavior_health_model.joblib"; do
+            if [ ! -f "$f" ]; then
+              echo "File '$f' not found locally. Will try to fetch if it exists in repo..."
+              need_fetch=1
+            fi
+          done
+
+          if [ "$need_fetch" = "1" ]; then
+            # 兩支 .py
+            for f in "firestore_predict_writeback.py" "predict_and_advise.py"; do
+              if [ ! -f "$f" ]; then
+                curl -L -f "${base}/${f}" -o "$f" || echo "Skip fetching $f (not in repo)."
+              fi
+            done
+            # 先抓 zip；抓不到再試 joblib（避免你直接放 joblib）
+            if [ ! -f "behavior_health_model.zip" ]; then
+              curl -L -f "${base}/behavior_health_model.zip" -o "behavior_health_model.zip" || echo "No zip in repo."
+            fi
+            if [ ! -f "behavior_health_model.joblib" ]; then
+              curl -L -f "${base}/behavior_health_model.joblib" -o "behavior_health_model.joblib" || echo "No joblib in repo."
+            fi
+          fi
+
+          echo "After fallback download:"
+          ls -la
 
       # 解壓 model：behavior_health_model.zip -> behavior_health_model.joblib
       - name: Unzip model if needed
