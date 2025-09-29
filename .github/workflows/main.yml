@@ -39,33 +39,25 @@ jobs:
           print("Wrote sa.json for project:", data.get("project_id"))
           PY
 
-      # 這一步會把你上傳到根目錄的 behavior_health_model.zip 解壓成 joblib
+      # 解壓 model：behavior_health_model.zip -> behavior_health_model.joblib
       - name: Unzip model if needed
         working-directory: ${{ github.workspace }}
         run: |
-          if [ -f behavior_health_model.zip ]; then
+          echo "Before unzip:"; ls -la
+          if [ -f behavior_health_model.joblib ]; then
+            echo "joblib already present."
+          elif [ -f behavior_health_model.zip ]; then
             echo "Found zip, unzip to joblib..."
             unzip -o behavior_health_model.zip
+          else
+            echo "No model file (.joblib or .zip) found in repo root."; exit 1
           fi
-          ls -la
-
-      # （可選）如果你的兩支 .py 沒在 repo，保留這段並把佔位文字換成真實程式碼。
-      # 若已經在 repo 根目錄，就把整段刪掉。
-      - name: Write scripts from workflow (temp)
-        working-directory: ${{ github.workspace }}
-        run: |
-          cat > predict_and_advise.py <<'PY'
-          # <<< 在這裡貼你的「predict_and_advise.py」完整內容 >>>
-          PY
-          cat > firestore_predict_writeback.py <<'PY'
-          # <<< 在這裡貼你的「firestore_predict_writeback.py」完整內容 >>>
-          PY
+          echo "After unzip:"; ls -la
 
       - name: Assert files exist
         working-directory: ${{ github.workspace }}
         shell: bash
         run: |
-          echo "PWD=$(pwd)"
           for f in firestore_predict_writeback.py predict_and_advise.py behavior_health_model.joblib sa.json; do
             [ -f "$f" ] && echo "✅ $f found" || { echo "❌ MISSING: $f"; exit 1; }
           done
