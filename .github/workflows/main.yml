@@ -39,7 +39,18 @@ jobs:
           print("Wrote sa.json for project:", data.get("project_id"))
           PY
 
-      # ⭐ 先把兩支 .py 寫到工作目錄（把佔位文字換成真正程式碼）
+      # 這一步會把你上傳到根目錄的 behavior_health_model.zip 解壓成 joblib
+      - name: Unzip model if needed
+        working-directory: ${{ github.workspace }}
+        run: |
+          if [ -f behavior_health_model.zip ]; then
+            echo "Found zip, unzip to joblib..."
+            unzip -o behavior_health_model.zip
+          fi
+          ls -la
+
+      # （可選）如果你的兩支 .py 沒在 repo，保留這段並把佔位文字換成真實程式碼。
+      # 若已經在 repo 根目錄，就把整段刪掉。
       - name: Write scripts from workflow (temp)
         working-directory: ${{ github.workspace }}
         run: |
@@ -47,7 +58,7 @@ jobs:
           # <<< 在這裡貼你的「predict_and_advise.py」完整內容 >>>
           PY
           cat > firestore_predict_writeback.py <<'PY'
-          # <<< 在這裡貼我給你的「firestore_predict_writeback.py」完整內容 >>>
+          # <<< 在這裡貼你的「firestore_predict_writeback.py」完整內容 >>>
           PY
 
       - name: Assert files exist
@@ -55,7 +66,6 @@ jobs:
         shell: bash
         run: |
           echo "PWD=$(pwd)"
-          ls -la
           for f in firestore_predict_writeback.py predict_and_advise.py behavior_health_model.joblib sa.json; do
             [ -f "$f" ] && echo "✅ $f found" || { echo "❌ MISSING: $f"; exit 1; }
           done
