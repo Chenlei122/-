@@ -1,7 +1,7 @@
 name: Firestore Advice Cron
 on:
   schedule:
-    - cron: "*/10 * * * *"    # 每 10 分鐘（UTC）
+    - cron: "*/10 * * * *"   # 每 10 分鐘（UTC）
   workflow_dispatch:
 
 jobs:
@@ -40,7 +40,7 @@ jobs:
           print("Wrote sa.json for project:", data.get("project_id"))
           PY
 
-      # ⭐ 從最新 Release 下載模型 asset（名為 behavior_health_model.zip）
+      # 從最新 Release 下載模型
       - name: Download model from release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -60,7 +60,7 @@ jobs:
                "$ASSET_URL" -o behavior_health_model.zip
           ls -la
 
-      # ⛑️ 若兩支腳本不存在，就用 GitHub API 從 main 取 raw 回來（私有 repo 也可）
+      # 若兩支腳本不存在，用 API 從 main 拉原始檔
       - name: Ensure scripts from repo (raw via API)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -81,6 +81,28 @@ jobs:
             fi
           done
           echo "After ensure scripts:"; ls -la
+
+      # 🔎 列出 health_data 最新日期與筆數（已修正縮排）
+      - name: Debug latest health_data
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+        run: |
+          python - <<'PY'
+          from google.cloud import firestore
+          db = firestore.Client()
+
+          date_ids = sorted([d.id for d in db.collection('health_data').list_documents()])
+          print("Total dates:", len(date_ids))
+          print("Tail dates:", date_ids[-5:])
+
+          if date_ids:
+            latest_date = date_ids[-1]
+            rec_ids = sorted([r.id for r in db.collection('health_data').document(latest_date).collection('records').list_documents()])
+            print(f"Latest date = {latest_date}, records count = {len(rec_ids)}")
+            print("Tail times:", rec_ids[-10:])
+          else:
+            print("No health_data yet.")
+          PY
 
       - name: Unzip model if needed
         run: |
@@ -106,4 +128,4 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
         run: |
-          python ./firestore_predict_writeback.py --key ./sa.json --root health_data --days 1
+          python ./firestore_predict_writeback.py --key ./sa.json --root health_data --days 7
