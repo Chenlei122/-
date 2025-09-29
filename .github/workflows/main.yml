@@ -1,1 +1,59 @@
+name: Firestore Advice Cron
+on:
+  schedule:
+    - cron: "*/10 * * * *"    # 每 10 分鐘（UTC）
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install firebase-admin google-cloud-firestore pandas joblib
+
+      - name: Write service account key
+        shell: bash
+        env:
+          SA_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+        run: |
+          python - <<'PY'
+          import os, json, sys, pathlib
+          raw = os.environ.get("SA_JSON")
+          if not raw:
+            print("ERROR: Secret GOOGLE_APPLICATION_CREDENTIALS_JSON missing"); sys.exit(1)
+          data = json.loads(raw)
+          assert data.get("type")=="service_account", "Not a service_account JSON"
+          pathlib.Path("sa.json").write_text(raw, encoding="utf-8")
+          print("Wrote sa.json for project:", data.get("project_id"))
+          PY
+
+      - name: Debug repo files (optional)
+        run: |
+          echo "PWD:"; pwd
+          echo "Workspace:" $GITHUB_WORKSPACE
+          ls -lah
+          echo "--- find python files ---"
+          find "$GITHUB_WORKSPACE" -maxdepth 2 -type f -name "*.py" -print
+          echo "--- existence check ---"
+          python - <<'PY'
+          import os
+          for f in ["predict_and_advise.py","firestore_predict_writeback.py","behavior_health_model.joblib","sa.json"]:
+              print(f, "=>", os.path.exists(f), "abs:", os.path.abspath(f))
+          PY
+
+      - name: Run advice writer
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+        run: |
+          python "$GITHUB_WORKSPACE/firestore_predict_writeback.py" --key "$GITHUB_WORKSPACE/sa.json" --root health_data --days 1
 
