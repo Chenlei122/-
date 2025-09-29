@@ -14,30 +14,17 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Debug git & files (before)
-        working-directory: ${{ github.workspace }}
-        run: |
-          echo "GITHUB_REPOSITORY=${GITHUB_REPOSITORY}"
-          echo "GITHUB_REF=${GITHUB_REF}"
-          echo "GITHUB_REF_NAME=${GITHUB_REF_NAME}"
-          echo "GITHUB_SHA=${GITHUB_SHA}"
-          git log --oneline -n 5 || true
-          echo "Repo root listing:"
-          ls -la
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
-        working-directory: ${{ github.workspace }}
         run: |
           python -m pip install --upgrade pip
           pip install firebase-admin google-cloud-firestore pandas joblib
 
       - name: Write service account key
-        working-directory: ${{ github.workspace }}
         shell: bash
         env:
           SA_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
@@ -53,45 +40,27 @@ jobs:
           print("Wrote sa.json for project:", data.get("project_id"))
           PY
 
-      # ⛑️ 若檔案缺少，直接從 repo main 抓原始檔回來
-      - name: Fallback download missing files from repo
-        working-directory: ${{ github.workspace }}
+      # ⭐ 從最新 Release 下載模型 asset（名為 behavior_health_model.zip）
+      - name: Download model from release
         env:
-          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          base="https://raw.githubusercontent.com/${REPO}/main"
-          need_fetch=0
-
-          for f in "firestore_predict_writeback.py" "predict_and_advise.py" "behavior_health_model.zip" "behavior_health_model.joblib"; do
-            if [ ! -f "$f" ]; then
-              echo "File '$f' not found locally. Will try to fetch if it exists in repo..."
-              need_fetch=1
-            fi
-          done
-
-          if [ "$need_fetch" = "1" ]; then
-            # 兩支 .py
-            for f in "firestore_predict_writeback.py" "predict_and_advise.py"; do
-              if [ ! -f "$f" ]; then
-                curl -L -f "${base}/${f}" -o "$f" || echo "Skip fetching $f (not in repo)."
-              fi
-            done
-            # 先抓 zip；抓不到再試 joblib（避免你直接放 joblib）
-            if [ ! -f "behavior_health_model.zip" ]; then
-              curl -L -f "${base}/behavior_health_model.zip" -o "behavior_health_model.zip" || echo "No zip in repo."
-            fi
-            if [ ! -f "behavior_health_model.joblib" ]; then
-              curl -L -f "${base}/behavior_health_model.joblib" -o "behavior_health_model.joblib" || echo "No joblib in repo."
-            fi
+          sudo apt-get update -y && sudo apt-get install -y jq
+          echo "Query latest release..."
+          LATEST=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
+                   https://api.github.com/repos/${{ github.repository }}/releases/latest)
+          ASSET_URL=$(echo "$LATEST" | jq -r '.assets[] | select(.name=="behavior_health_model.zip") | .url')
+          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+            echo "No asset named behavior_health_model.zip in latest release."; exit 1
           fi
-
-          echo "After fallback download:"
+          echo "Downloading model asset..."
+          curl -L -H "Authorization: Bearer ${GH_TOKEN}" \
+               -H "Accept: application/octet-stream" \
+               "$ASSET_URL" -o behavior_health_model.zip
           ls -la
 
-      # 解壓 model：behavior_health_model.zip -> behavior_health_model.joblib
       - name: Unzip model if needed
-        working-directory: ${{ github.workspace }}
         run: |
           echo "Before unzip:"; ls -la
           if [ -f behavior_health_model.joblib ]; then
@@ -100,12 +69,11 @@ jobs:
             echo "Found zip, unzip to joblib..."
             unzip -o behavior_health_model.zip
           else
-            echo "No model file (.joblib or .zip) found in repo root."; exit 1
+            echo "No model file (.joblib or .zip) found."; exit 1
           fi
           echo "After unzip:"; ls -la
 
       - name: Assert files exist
-        working-directory: ${{ github.workspace }}
         shell: bash
         run: |
           for f in firestore_predict_writeback.py predict_and_advise.py behavior_health_model.joblib sa.json; do
@@ -113,7 +81,6 @@ jobs:
           done
 
       - name: Run advice writer
-        working-directory: ${{ github.workspace }}
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
         run: |
