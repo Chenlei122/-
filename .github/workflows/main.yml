@@ -60,6 +60,28 @@ jobs:
                "$ASSET_URL" -o behavior_health_model.zip
           ls -la
 
+      # ⛑️ 若兩支腳本不存在，就用 GitHub API 從 main 取 raw 回來（私有 repo 也可）
+      - name: Ensure scripts from repo (raw via API)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -e
+          fetch_raw () {
+            FILE="$1"
+            echo "Trying to fetch $FILE from main..."
+            curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                 -H "Accept: application/vnd.github.raw" \
+                 "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${FILE}?ref=main" \
+                 -o "${FILE}" || { echo "Fetch ${FILE} failed"; return 1; }
+          }
+          for f in firestore_predict_writeback.py predict_and_advise.py; do
+            if [ ! -f "$f" ]; then
+              fetch_raw "$f"
+            fi
+          done
+          echo "After ensure scripts:"; ls -la
+
       - name: Unzip model if needed
         run: |
           echo "Before unzip:"; ls -la
