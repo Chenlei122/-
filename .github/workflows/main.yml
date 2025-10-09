@@ -1,3 +1,88 @@
+name: Firestore Advice Cron
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # 每 10 分鐘（UTC）
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (force main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install firebase-admin google-cloud-firestore pandas joblib
+
+      - name: Write service account key
+        shell: bash
+        env:
+          SA_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+        run: |
+          python - <<'PY'
+          import os, json, sys, pathlib
+          raw = os.environ.get("SA_JSON")
+          if not raw:
+              print("ERROR: Secret GOOGLE_APPLICATION_CREDENTIALS_JSON missing"); sys.exit(1)
+          data = json.loads(raw)
+          assert data.get("type") == "service_account"
+          pathlib.Path("sa.json").write_text(raw, encoding="utf-8")
+          print("Wrote sa.json for project:", data.get("project_id"))
+          PY
+
+      # 從最新 Release 下載模型
+      - name: Download model from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          sudo apt-get update -y && sudo apt-get install -y jq
+          echo "Query latest release..."
+          LATEST=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
+                   https://api.github.com/repos/${{ github.repository }}/releases/latest)
+          ASSET_URL=$(echo "$LATEST" | jq -r '.assets[] | select(.name=="behavior_health_model.zip") | .url')
+          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+            echo "No asset named behavior_health_model.zip in latest release."; exit 1
+          fi
+          echo "Downloading model asset..."
+          curl -L -H "Authorization: Bearer ${GH_TOKEN}" \
+               -H "Accept: application/octet-stream" \
+               "$ASSET_URL" -o behavior_health_model.zip
+          ls -la
+
+      # 若兩支腳本不存在，用 API 從 main 拉原始檔
+      - name: Ensure scripts from repo (raw via API)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -e
+          fetch_raw () {
+            FILE="$1"
+            echo "Trying to fetch $FILE from main..."
+            curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                 -H "Accept: application/vnd.github.raw" \
+                 "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${FILE}?ref=main" \
+                 -o "${FILE}" || { echo "Fetch ${FILE} failed"; return 1; }
+          }
+          for f in firestore_predict_writeback.py predict_and_advise.py; do
+            if [ ! -f "$f" ]; then
+              fetch_raw "$f"
+            fi
+          done
+          echo "After ensure scripts:"; ls -la
+
       # 🔎 印出 health_data 現況（確認有掃到）
       - name: Debug latest health_data
         env:
@@ -10,15 +95,44 @@
           print("Total dates:", len(date_ids))
           print("Tail dates:", date_ids[-5:])
           if date_ids:
-            latest_date = date_ids[-1]
-            rec_ids = sorted([r.id for r in db.collection('health_data').document(latest_date).collection('records').list_documents()])
-            print(f"Latest date = {latest_date}, records count = {len(rec_ids)}")
-            print("Tail times:", rec_ids[-10:])
+              latest_date = date_ids[-1]
+              rec_ids = sorted([r.id for r in db.collection('health_data').document(latest_date).collection('records').list_documents()])
+              print(f"Latest date = {latest_date}, records count = {len(rec_ids)}")
+              print("Tail times:", rec_ids[-10:])
           else:
-            print("No health_data yet.")
+              print("No health_data yet.")
           PY
 
-      # 🛠️ 先驗證可寫 & 路徑正確：寫入 _ping
+      - name: Unzip model if needed
+        run: |
+          echo "Before unzip:"; ls -la
+          if [ -f behavior_health_model.joblib ]; then
+            echo "joblib already present."
+          elif [ -f behavior_health_model.zip ]; then
+            echo "Found zip, unzip to joblib..."
+            unzip -o behavior_health_model.zip
+          else
+            echo "No model file (.joblib or .zip) found."; exit 1
+          fi
+          echo "After unzip:"; ls -la
+
+      - name: Assert files exist
+        shell: bash
+        run: |
+          for f in firestore_predict_writeback.py predict_and_advise.py behavior_health_model.joblib sa.json; do
+            [ -f "$f" ] && echo "✅ $f found" || { echo "❌ MISSING: $f"; exit 1; }
+          done
+
+      # ✅ 單一強制＋詳細版
+      - name: Run advice writer (force + verbose)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+        run: |
+          python ./firestore_predict_writeback.py \
+            --key ./sa.json --root health_data --days 7 \
+            --force --verbose
+          echo "If wrote==0, it is usually schema mismatch or time-window empty."
+
       - name: Dump latest doc (keys) and try a write
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
@@ -30,7 +144,7 @@
           db = firestore.Client()
           root = 'health_data'
 
-          # 1) 找最新日期/時間 doc
+          # 1) 找到最新日期與最新時間文件
           dates = sorted([d.id for d in db.collection(root).list_documents()])
           print("DATES tail:", dates[-5:])
           if not dates:
@@ -54,15 +168,14 @@
           print("Raw keys:", sorted(list(data.keys())))
           print("Raw content:", data)
 
-          # 2) 寫入 _ping 驗證寫入權限
+          # 2) 試著寫入一個 _ping 欄位驗證權限
           now = datetime.now(timezone.utc).isoformat()
           doc_ref.set({"_ping": now}, merge=True)
           print("WROTE _ping =", now)
           PY
 
-      # （可選）先人工寫一筆 advice，確認路徑與權限完全 OK
       - name: (Optional) Write dummy advice to latest doc
-        if: ${{ always() }}   # 需要時可以改成條件旗標
+        if: ${{ always() }}
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
         run: |
@@ -95,8 +208,7 @@
           print("DUMMY advice written to:", path)
           PY
 
-      # ✅ 最後才跑真正的寫回程式（單一版本，verbose、不緩衝）
-      - name: Run advice writer (force + verbose)
+      - name: Run advice writer (force + verbose, 14d window)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           PYTHONUNBUFFERED: "1"
