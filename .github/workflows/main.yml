@@ -82,7 +82,7 @@ jobs:
           done
           echo "After ensure scripts:"; ls -la
 
-      # 🔎 列出 health_data 最新日期與筆數（已修正縮排）
+      # 🔎 印出 health_data 現況（確認有掃到）
       - name: Debug latest health_data
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
@@ -90,11 +90,9 @@ jobs:
           python - <<'PY'
           from google.cloud import firestore
           db = firestore.Client()
-
           date_ids = sorted([d.id for d in db.collection('health_data').list_documents()])
           print("Total dates:", len(date_ids))
           print("Tail dates:", date_ids[-5:])
-
           if date_ids:
             latest_date = date_ids[-1]
             rec_ids = sorted([r.id for r in db.collection('health_data').document(latest_date).collection('records').list_documents()])
@@ -124,11 +122,12 @@ jobs:
             [ -f "$f" ] && echo "✅ $f found" || { echo "❌ MISSING: $f"; exit 1; }
           done
 
-      - name: Run advice writer
+      # ✅ 改成單一強制＋詳細版，避免重複 step 與縮排錯誤
+      - name: Run advice writer (force + verbose)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
         run: |
-          python ./firestore_predict_writeback.py --key ./sa.json --root health_data --days 7
-      - name: Sanity check (tail advice writes)
-        run: |
-          echo "If wrote==0, almost always schema mismatch or time-window empty."
+          python ./firestore_predict_writeback.py \
+            --key ./sa.json --root health_data --days 7 \
+            --force --verbose
+          echo "If wrote==0, it is usually schema mismatch or time-window empty."
