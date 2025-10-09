@@ -41,7 +41,6 @@ jobs:
           print("Wrote sa.json for project:", data.get("project_id"))
           PY
 
-      # 從最新 Release 下載模型
       - name: Download model from release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -61,7 +60,6 @@ jobs:
                "$ASSET_URL" -o behavior_health_model.zip
           ls -la
 
-      # 若兩支腳本不存在，用 API 從 main 拉原始檔
       - name: Ensure scripts from repo (raw via API)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -83,7 +81,6 @@ jobs:
           done
           echo "After ensure scripts:"; ls -la
 
-      # 🔎 印出 health_data 現況（確認有掃到）
       - name: Debug latest health_data
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
@@ -123,97 +120,12 @@ jobs:
             [ -f "$f" ] && echo "✅ $f found" || { echo "❌ MISSING: $f"; exit 1; }
           done
 
-      # ✅ 單一強制＋詳細版
       - name: Run advice writer (force + verbose)
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
-        run: |
-          python ./firestore_predict_writeback.py \
-            --key ./sa.json --root health_data --days 7 \
-            --force --verbose
-          echo "If wrote==0, it is usually schema mismatch or time-window empty."
-
-      - name: Dump latest doc (keys) and try a write
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
-        run: |
-          python - <<'PY'
-          from google.cloud import firestore
-          from datetime import datetime, timezone
-
-          db = firestore.Client()
-          root = 'health_data'
-
-          # 1) 找到最新日期與最新時間文件
-          dates = sorted([d.id for d in db.collection(root).list_documents()])
-          print("DATES tail:", dates[-5:])
-          if not dates:
-              print("No dates in collection:", root); raise SystemExit(0)
-
-          latest_date = dates[-1]
-          recs_ref = db.collection(root).document(latest_date).collection('records')
-          rec_ids = sorted([r.id for r in recs_ref.list_documents()])
-          print(f"Latest date = {latest_date}, record count = {len(rec_ids)}")
-          if not rec_ids:
-              print("No records under", latest_date); raise SystemExit(0)
-
-          latest_time = rec_ids[-1]
-          doc_ref = recs_ref.document(latest_time)
-          doc = doc_ref.get()
-          print("LATEST DOC PATH:", f"{root}/{latest_date}/records/{latest_time}")
-          if not doc.exists:
-              print("Doc not exists?"); raise SystemExit(0)
-
-          data = doc.to_dict() or {}
-          print("Raw keys:", sorted(list(data.keys())))
-          print("Raw content:", data)
-
-          # 2) 試著寫入一個 _ping 欄位驗證權限
-          now = datetime.now(timezone.utc).isoformat()
-          doc_ref.set({"_ping": now}, merge=True)
-          print("WROTE _ping =", now)
-          PY
-
-      - name: (Optional) Write dummy advice to latest doc
-        if: ${{ always() }}
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
-        run: |
-          python - <<'PY'
-          from google.cloud import firestore
-          from datetime import datetime, timezone
-          db = firestore.Client()
-          root='health_data'
-          dates = sorted([d.id for d in db.collection(root).list_documents()])
-          if not dates: raise SystemExit(0)
-          latest_date = dates[-1]
-          recs = sorted([r.id for r in db.collection(root).document(latest_date).collection('records').list_documents()])
-          if not recs: raise SystemExit(0)
-          latest_time = recs[-1]
-          path = f"{root}/{latest_date}/records/{latest_time}"
-          doc_ref = db.document(path)
-
-          now = datetime.now(timezone.utc).isoformat()
-          payload = {
-            "_advised": True,
-            "_advised_at_utc": now,
-            "advice": {
-              "state": "ok",
-              "tips": ["dummy tip: pipeline wiring ok"],
-              "features_used": ["steps","weather","avg_heart_rate"],
-              "model_version": "debug-dummy"
-            }
-          }
-          doc_ref.set(payload, merge=True)
-          print("DUMMY advice written to:", path)
-          PY
-
-      - name: Run advice writer (force + verbose, 14d window)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           PYTHONUNBUFFERED: "1"
         run: |
           python -u ./firestore_predict_writeback.py \
-            --key ./sa.json --root health_data --days 14 \
+            --key ./sa.json --root health_data --days 7 \
             --force --verbose
-          echo "If wrote==0, schema mismatch or empty window."
+          echo "If wrote==0, schema mismatch or time-window empty."
