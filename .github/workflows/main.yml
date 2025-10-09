@@ -129,3 +129,6 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
         run: |
           python ./firestore_predict_writeback.py --key ./sa.json --root health_data --days 7
+      - name: Sanity check (tail advice writes)
+        run: |
+          echo "If wrote==0, almost always schema mismatch or time-window empty."
