@@ -1,3 +1,86 @@
+name: Firestore Advice Cron
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # 每 10 分鐘（UTC）
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (force main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install firebase-admin google-cloud-firestore pandas joblib
+
+      - name: Write service account key
+        shell: bash
+        env:
+          SA_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+        run: |
+          python - <<'PY'
+          import os, json, sys, pathlib
+          raw = os.environ.get("SA_JSON")
+          if not raw:
+            print("ERROR: Secret GOOGLE_APPLICATION_CREDENTIALS_JSON missing"); sys.exit(1)
+          data = json.loads(raw)
+          assert data.get("type") == "service_account"
+          pathlib.Path("sa.json").write_text(raw, encoding="utf-8")
+          print("Wrote sa.json for project:", data.get("project_id"))
+          PY
+
+      - name: Download model from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          sudo apt-get update -y && sudo apt-get install -y jq
+          echo "Query latest release..."
+          LATEST=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/${{ github.repository }}/releases/latest)
+          ASSET_URL=$(echo "$LATEST" | jq -r '.assets[] | select(.name=="behavior_health_model.zip") | .url')
+          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+            echo "No asset named behavior_health_model.zip in latest release."; exit 1
+          fi
+          echo "Downloading model asset..."
+          curl -L -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" "$ASSET_URL" -o behavior_health_model.zip
+          ls -la
+
+      # === 強制以 main 的原始檔覆蓋兩支腳本，避免舊檔殘留 ===
+      - name: Ensure scripts from repo (raw via API, force refresh)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          fetch_raw () {
+            FILE="$1"
+            echo "Fetching $FILE from main..."
+            curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                 -H "Accept: application/vnd.github.raw" \
+                 "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${FILE}?ref=main" \
+                 -o "${FILE}"
+          }
+          rm -f predict_and_advise.py firestore_predict_writeback.py
+          fetch_raw predict_and_advise.py
+          fetch_raw firestore_predict_writeback.py
+          echo "SHA256 of predict_and_advise.py:"
+          (sha256sum predict_and_advise.py || shasum -a 256 predict_and_advise.py) 2>/dev/null || true
+          echo "Functions containing 'make_advice' in predict_and_advise.py:"
+          (grep -n "def make_advice" predict_and_advise.py || true)
+          ls -la
+
       # === 列印檔案與片段，確認內容 ===
       - name: List repo files and preview predict_and_advise.py
         shell: bash
@@ -41,3 +124,113 @@ def make_advice(record: dict, model_path: str = "behavior_health_model.joblib"):
           else:
               print("make_advice already present")
           PY
+
+      # === 模組自檢：確認 make_advice 存在且被載到 ===
+      - name: Sanity check predict_and_advise module
+        run: |
+          python - <<'PY'
+          import importlib, inspect, sys
+          m = importlib.import_module("predict_and_advise")
+          print("MODULE FILE =", m.__file__)
+          if not hasattr(m, "make_advice"):
+              print("FATAL: 'make_advice' not found in module"); sys.exit(2)
+          print("OK: make_advice found")
+          src = inspect.getsource(m.make_advice)
+          print("make_advice preview:\n", "\n".join(src.splitlines()[:8]))
+          PY
+
+      - name: Debug latest health_data
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+        run: |
+          python - <<'PY'
+          from google.cloud import firestore
+          db = firestore.Client()
+          date_ids = sorted([d.id for d in db.collection('health_data').list_documents()])
+          print("Total dates:", len(date_ids))
+          print("Tail dates:", date_ids[-5:])
+          if date_ids:
+              latest_date = date_ids[-1]
+              rec_ids = sorted([r.id for r in db.collection('health_data').document(latest_date).collection('records').list_documents()])
+              print(f"Latest date = {latest_date}, records count = {len(rec_ids)}")
+              print("Tail times:", rec_ids[-10:])
+          else:
+              print("No health_data yet.")
+          PY
+
+      - name: Unzip model if needed
+        run: |
+          echo "Before unzip:"; ls -la
+          if [ -f behavior_health_model.joblib ]; then
+            echo "joblib already present."
+          elif [ -f behavior_health_model.zip ]; then
+            echo "Found zip, unzip to joblib..."
+            unzip -o behavior_health_model.zip
+          else
+            echo "No model file (.joblib or .zip) found."; exit 1
+          fi
+          echo "After unzip:"; ls -la
+
+      - name: Assert files exist
+        shell: bash
+        run: |
+          for f in firestore_predict_writeback.py predict_and_advise.py behavior_health_model.joblib sa.json; do
+            [ -f "$f" ] && echo "✅ $f found" || { echo "❌ MISSING: $f"; exit 1; }
+          done
+
+      # ---------- 寫入前的兩個偵錯 ----------
+      - name: Dump latest record (raw JSON)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+        run: |
+          python - <<'PY'
+          from google.cloud import firestore
+          db = firestore.Client()
+          root='health_data'
+          dates = sorted([d.id for d in db.collection(root).list_documents()])
+          if not dates:
+              print("No dates"); raise SystemExit(0)
+          latest_date = dates[-1]
+          recs = sorted([r.id for r in db.collection(root).document(latest_date).collection('records').list_documents()])
+          if not recs:
+              print("No records under", latest_date); raise SystemExit(0)
+          latest_time = recs[-1]
+          ref = db.collection(root).document(latest_date).collection('records').document(latest_time)
+          snap = ref.get()
+          print("PATH:", ref.path)
+          print("RAW:", snap.to_dict())
+          PY
+
+      - name: Dry-run advice on latest record (no write)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+        run: |
+          python - <<'PY'
+          from google.cloud import firestore
+          from predict_and_advise import make_advice
+          import json
+          db = firestore.Client()
+          root='health_data'
+          dates = sorted([d.id for d in db.collection(root).list_documents()])
+          if not dates: raise SystemExit("No dates")
+          latest_date = dates[-1]
+          recs = sorted([r.id for r in db.collection(root).document(latest_date).collection('records').list_documents()])
+          if not recs: raise SystemExit("No records")
+          latest_time = recs[-1]
+          ref = db.collection(root).document(latest_date).collection('records').document(latest_time)
+          data = ref.get().to_dict() or {}
+          payload = make_advice(data, model_path="behavior_health_model.joblib")
+          print("PATH:", ref.path)
+          print("PAYLOAD-PREVIEW:", json.dumps(payload, ensure_ascii=False))
+          PY
+
+      # ---------- 正式寫入（近 24h、不強制覆寫） ----------
+      - name: Run advice writer (verbose, last 24h, no force)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python -u ./firestore_predict_writeback.py \
+            --key ./sa.json --root health_data --since-hours 24 \
+            --verbose
+          echo "If wrote==0, likely no fresh docs or unusable features."
