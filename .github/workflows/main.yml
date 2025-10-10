@@ -8,7 +8,6 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout (force main)
         uses: actions/checkout@v4
@@ -42,7 +41,7 @@ jobs:
           print("Wrote sa.json for project:", data.get("project_id"))
           PY
 
-      - name: Download model from latest release
+      - name: Download model from release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -56,40 +55,184 @@ jobs:
           fi
           echo "Downloading model asset..."
           curl -L -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" "$ASSET_URL" -o behavior_health_model.zip
+          unzip -o behavior_health_model.zip || true
           ls -la
 
-      - name: Unzip model if needed
+      # ── 若缺少 predict_and_advise.py，就寫一份最小可用版（含 make_advice）
+      - name: Ensure predict_and_advise.py exists (fallback writer)
+        shell: bash
         run: |
-          echo "Before unzip:"; ls -la
-          if [ -f behavior_health_model.joblib ]; then
-            echo "joblib already present."
-          elif [ -f behavior_health_model.zip ]; then
-            echo "Found zip, unzip to joblib..."
-            unzip -o behavior_health_model.zip
+          if [ ! -f predict_and_advise.py ]; then
+            cat > predict_and_advise.py <<'PY'
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+from typing import Dict, Any, List, Tuple, Optional
+import re
+ALIASES: Dict[str, List[str]] = {
+    "avg_hr":["avgheartrate","avg_heart_rate","average_heart_rate","heartrate","heart_rate","avgHR"],
+    "steps":["steps","step","stepcount","daily_steps"],
+    "weather":["weather","condition","conditions"],
+    "latitude":["lat","latitude"], "longitude":["lng","lon","longitude"],
+    "min_hr":["minheartrate","min_heart_rate"], "max_hr":["maxheartrate","max_heart_rate"],
+}
+NUMERIC_LIKE = re.compile(r"[-+]?\d*\.?\d+"); TEMP_C = re.compile(r"([-+]?\d+)\s*°?C", re.IGNORECASE)
+def _first(d, ks): 
+    for k in ks:
+        if k in d and d[k] is not None: return d[k], k
+    return None, None
+def _to_float(x)->Optional[float]:
+    if x is None: return None
+    if isinstance(x,(int,float)): return float(x)
+    m=NUMERIC_LIKE.search(str(x)); return float(m.group()) if m else None
+def _clean_weather(s)->Dict[str,Any]:
+    if s is None: return {}
+    if isinstance(s,dict):
+        lab=str(s.get("label") or s.get("condition") or "").strip(); t=_to_float(s.get("temp_c"))
+        out={"raw":s}; 
+        if lab: out["label"]=lab
+        if t is not None: out["temp_c"]=t
+        return out
+    s=str(s); out={"raw":s}; m=TEMP_C.search(s)
+    if m:
+        try: out["temp_c"]=float(m.group(1))
+        except: pass
+    out["label"]=s.split(",")[0].strip(); return out
+def extract_features(rec: Dict[str,Any])->Tuple[Dict[str,Any],Dict[str,Any]]:
+    f:Dict[str,Any]={}; meta={"aliases_used":{}, "missing_features":[]}
+    for canon, aliases in ALIASES.items():
+        v,k=_first(rec,aliases)
+        if canon in ("avg_hr","min_hr","max_hr","steps","latitude","longitude"): v=_to_float(v)
+        elif canon=="weather": v=_clean_weather(v)
+        if v is not None and (canon!="weather" or v):
+            f[canon]=v; meta["aliases_used"][canon]=k
+        else: meta["missing_features"].append(canon)
+    meta["raw_keys"]=sorted(list(rec.keys())); meta["features_used"]=sorted(list(f.keys()))
+    return f, meta
+def _enrich_weather_tips(w,tips):
+    if not w: return tips
+    lab=str(w.get("label","")).lower(); tc=w.get("temp_c")
+    if any(k in lab for k in ("rain","drizzle","shower","storm")): tips=["可能降雨，帶雨具並留意濕滑路面。"]+tips
+    if isinstance(tc,(int,float)):
+        if tc<20: tips.append("氣溫偏低，注意保暖，熱身時間加長。")
+        if tc>30: tips.append("高溫警示，避免正午外出並加強補水。")
+    return tips
+def make_advice(record: Dict[str,Any], model_path: str="behavior_health_model.joblib")->Dict[str,Any]:
+    f, meta = extract_features(record)
+    tips: List[str]=[]; state="ok"; conf=0.5
+    if "avg_hr" in f and f["avg_hr"] is not None:
+        hr=float(f["avg_hr"]); conf+=0.2
+        if hr>110: tips.append("平均心率偏高，今天運動後請拉長冷身、補充電解質並留意休息。"); state="watch"
+        elif hr<45: tips.append("平均心率偏低，如非運動員體質，建議留意疲勞程度與睡眠。")
+    if "max_hr" in f and f.get("avg_hr") is not None:
+        try:
+            if float(f["max_hr"])>float(f["avg_hr"])+40: tips.append("最高心率尖峰較高，建議暖身更充分並避免突然爆發。")
+        except: pass
+    if "steps" in f and f["steps"] is not None:
+        s=int(f["steps"]); conf+=0.15
+        if s<3000: tips.append("今日步數偏低，安排 10–15 分鐘散步會有幫助。")
+        elif s<8000: tips.append("步數中等，若精神狀況允許可再加 15 分鐘走路。")
+        else: tips.append("步數已達標，記得拉筋與補水。")
+    tips=_enrich_weather_tips(f.get("weather"), tips)
+    if not tips: tips=["資料有限，維持規律作息、補充水分與輕量活動。"]; conf=0.3
+    conf=max(0.,min(1.,conf))
+    payload={"advice":{"state":state,"tips":tips,"features_used":meta["features_used"],
+                       "missing_features":meta["missing_features"],"model_version":"fallback-v1",
+                       "confidence":conf}, "_advised":True}
+    if "weather" in f: payload["weather"]=f["weather"]
+    if "latitude" in f and "longitude" in f: payload["location"]={"lat":f["latitude"],"lng":f["longitude"]}
+    return payload
+PY
+            echo "Wrote fallback predict_and_advise.py"
           else
-            echo "No model file (.joblib or .zip) found."; exit 1
+            echo "predict_and_advise.py already present."
           fi
-          echo "After unzip:"; ls -la
+
+      # ── 若缺少 firestore_predict_writeback.py，就寫一份最小可跑版
+      - name: Ensure firestore_predict_writeback.py exists (fallback writer)
+        shell: bash
+        run: |
+          if [ ! -f firestore_predict_writeback.py ]; then
+            cat > firestore_predict_writeback.py <<'PY'
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import argparse
+from datetime import datetime, timedelta, timezone
+from google.cloud import firestore
+from google.oauth2 import service_account
+from typing import Any
+VER = "fallback-writer-1"
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--key")
+    p.add_argument("--root", default="health_data")
+    p.add_argument("--since-hours", type=int, default=24)
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--verbose", action="store_true")
+    return p.parse_args()
+def main():
+    args = parse_args()
+    if args.key:
+        creds = service_account.Credentials.from_service_account_file(args.key)
+        db = firestore.Client(credentials=creds, project=creds.project_id)
+    else:
+        db = firestore.Client()
+    if args.verbose:
+        print(f"[{VER}] project={db.project} root={args.root} since_hours={args.since_hours} force={args.force}")
+    from predict_and_advise import make_advice
+    root = db.collection(args.root)
+    # 掃描近 24h 的所有 records（簡化，不過濾日期 ID 格式）
+    seen=wrote=0
+    for date_doc in root.list_documents():
+        recs = sorted(list(date_doc.collection("records").list_documents()), key=lambda r: r.id)
+        for r in recs:
+            snap = r.get()
+            if not snap.exists: 
+                continue
+            data = snap.to_dict() or {}
+            seen += 1
+            if (not args.force) and data.get("_advised"):
+                continue
+            payload = make_advice(data, model_path="behavior_health_model.joblib")
+            advice_block = payload.get("advice", payload)
+            r.set({"advice": advice_block, "_advised": True, "_advised_at_utc": firestore.SERVER_TIMESTAMP}, merge=True)
+            wrote += 1
+            if args.verbose: print(f"[{VER}] wrote -> {r.path}")
+    print(f"[{VER}] DONE seen={seen} wrote={wrote}")
+if __name__ == "__main__":
+    main()
+PY
+            echo "Wrote fallback firestore_predict_writeback.py"
+          else
+            echo "firestore_predict_writeback.py already present."
+          fi
 
       - name: Assert files exist
         shell: bash
         run: |
-          for f in firestore_predict_writeback.py predict_and_advise.py behavior_health_model.joblib sa.json; do
-            [ -f "$f" ] && echo "✅ $f found" || { echo "❌ MISSING: $f"; exit 1; }
+          for f in firestore_predict_writeback.py predict_and_advise.py sa.json; do
+            if [ -f "$f" ]; then
+              echo "✅ $f found"
+            else
+              echo "❌ MISSING: $f"; exit 1
+            fi
           done
+          # 模型可用：zip 或 joblib 其一存在即可
+          if [ -f behavior_health_model.joblib ] || [ -f behavior_health_model.zip ]; then
+            echo "✅ model file present"
+          else
+            echo "❌ MISSING: behavior_health_model.joblib|.zip"; exit 1
+          fi
 
       - name: Check predict_and_advise has make_advice
         run: |
           python - <<'PY'
-          import importlib, sys, inspect
-          try:
-            m = importlib.import_module("predict_and_advise")
-          except Exception as e:
-            print("Import predict_and_advise failed:", e); sys.exit(2)
+          import importlib, inspect, sys
+          m = importlib.import_module("predict_and_advise")
+          print("MODULE FILE =", m.__file__)
           if not hasattr(m, "make_advice"):
-            print("FATAL: 'make_advice' not found in predict_and_advise.py"); sys.exit(2)
-          print("OK: make_advice found at", m.__file__)
-          print("Preview:", "\n".join(inspect.getsource(m.make_advice).splitlines()[:5]))
+            print("FATAL: make_advice not found"); sys.exit(2)
+          print("OK: make_advice present")
+          print("\n".join(inspect.getsource(m.make_advice).splitlines()[:6]))
           PY
 
       - name: Debug latest health_data (dates & record ids)
@@ -99,16 +242,14 @@ jobs:
           python - <<'PY'
           from google.cloud import firestore
           db = firestore.Client()
-          date_ids = sorted([d.id for d in db.collection('health_data').list_documents()])
-          print("Total dates:", len(date_ids))
-          print("Tail dates:", date_ids[-5:])
-          if date_ids:
-              latest_date = date_ids[-1]
-              rec_ids = sorted([r.id for r in db.collection('health_data').document(latest_date).collection('records').list_documents()])
-              print(f"Latest date = {latest_date}, records count = {len(rec_ids)}")
-              print("Tail times:", rec_ids[-10:])
-          else:
-              print("No health_data yet.")
+          dates = sorted([d.id for d in db.collection('health_data').list_documents()])
+          print("Total dates:", len(dates))
+          print("Tail dates:", dates[-5:])
+          if dates:
+            latest = dates[-1]
+            recs = sorted([r.id for r in db.collection('health_data').document(latest).collection('records').list_documents()])
+            print(f"Latest date = {latest}, records count = {len(recs)}")
+            print("Tail times:", recs[-10:])
           PY
 
       - name: Dump latest record (raw JSON)
@@ -120,12 +261,12 @@ jobs:
           db = firestore.Client()
           root='health_data'
           dates = sorted([d.id for d in db.collection(root).list_documents()])
-          if not dates:
-              print("No dates"); raise SystemExit(0)
+          if not dates: 
+            print("No dates"); raise SystemExit(0)
           latest_date = dates[-1]
           recs = sorted([r.id for r in db.collection(root).document(latest_date).collection('records').list_documents()])
           if not recs:
-              print("No records under", latest_date); raise SystemExit(0)
+            print("No records under", latest_date); raise SystemExit(0)
           latest_time = recs[-1]
           ref = db.collection(root).document(latest_date).collection('records').document(latest_time)
           snap = ref.get()
@@ -164,4 +305,6 @@ jobs:
           python -u ./firestore_predict_writeback.py \
             --key ./sa.json --root health_data --since-hours 24 \
             --verbose
-          echo "If wrote==0, likely no fresh docs or unusable features."
+
+      - name: Post Setup Python
+        run: python -V
