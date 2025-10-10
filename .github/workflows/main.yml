@@ -60,7 +60,8 @@ jobs:
                "$ASSET_URL" -o behavior_health_model.zip
           ls -la
 
-      - name: Ensure scripts from repo (raw via API)
+      # === 強制以 main 的原始檔覆蓋兩支腳本，避免舊檔殘留 ===
+      - name: Ensure scripts from repo (raw via API, force refresh)
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -68,18 +69,36 @@ jobs:
           set -e
           fetch_raw () {
             FILE="$1"
-            echo "Trying to fetch $FILE from main..."
+            echo "Fetching $FILE from main..."
             curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
                  -H "Accept: application/vnd.github.raw" \
                  "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${FILE}?ref=main" \
-                 -o "${FILE}" || { echo "Fetch ${FILE} failed"; return 1; }
+                 -o "${FILE}"
           }
-          for f in firestore_predict_writeback.py predict_and_advise.py; do
-            if [ ! -f "$f" ]; then
-              fetch_raw "$f"
-            fi
-          done
-          echo "After ensure scripts:"; ls -la
+          rm -f predict_and_advise.py firestore_predict_writeback.py
+          fetch_raw predict_and_advise.py
+          fetch_raw firestore_predict_writeback.py
+          echo "SHA256 of predict_and_advise.py:"
+          (sha256sum predict_and_advise.py || shasum -a 256 predict_and_advise.py) 2>/dev/null || true
+          echo "Functions containing 'make' in predict_and_advise.py:"
+          grep -n "def make_advice" -n predict_and_advise.py || true
+          ls -la
+
+      # === 模組自檢：確認 make_advice 存在、載到的檔案正確 ===
+      - name: Sanity check predict_and_advise module
+        run: |
+          python - <<'PY'
+          import importlib, inspect, sys
+          m = importlib.import_module("predict_and_advise")
+          print("MODULE FILE =", m.__file__)
+          names = [n for n in dir(m) if "make" in n.lower()]
+          print("EXPORTS containing 'make':", names)
+          if not hasattr(m, "make_advice"):
+              print("FATAL: 'make_advice' not found in module"); sys.exit(2)
+          src = inspect.getsource(m.make_advice)
+          print("make_advice preview:")
+          print("\n".join(src.splitlines()[:6]))
+          PY
 
       - name: Debug latest health_data
         env:
@@ -166,7 +185,7 @@ jobs:
           print("PAYLOAD-PREVIEW:", json.dumps(payload, ensure_ascii=False))
           PY
 
-      # ---------- 真正寫入（建議先用24小時視窗 & 不強制覆寫） ----------
+      # ---------- 正式寫入（建議先用 24 小時視窗 & 不強制覆寫） ----------
       - name: Run advice writer (verbose, last 24h, no force)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
