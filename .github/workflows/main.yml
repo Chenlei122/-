@@ -8,6 +8,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout (force main)
         uses: actions/checkout@v4
@@ -41,7 +42,7 @@ jobs:
           print("Wrote sa.json for project:", data.get("project_id"))
           PY
 
-      - name: Download model from release
+      - name: Download model from latest release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -56,102 +57,6 @@ jobs:
           echo "Downloading model asset..."
           curl -L -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" "$ASSET_URL" -o behavior_health_model.zip
           ls -la
-
-      # === 強制以 main 的原始檔覆蓋兩支腳本，避免舊檔殘留 ===
-      - name: Ensure scripts from repo (raw via API, force refresh)
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -e
-          fetch_raw () {
-            FILE="$1"
-            echo "Fetching $FILE from main..."
-            curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
-                 -H "Accept: application/vnd.github.raw" \
-                 "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${FILE}?ref=main" \
-                 -o "${FILE}"
-          }
-          rm -f predict_and_advise.py firestore_predict_writeback.py
-          fetch_raw predict_and_advise.py
-          fetch_raw firestore_predict_writeback.py
-          echo "SHA256 of predict_and_advise.py:"
-          (sha256sum predict_and_advise.py || shasum -a 256 predict_and_advise.py) 2>/dev/null || true
-          echo "Functions containing 'make_advice' in predict_and_advise.py:"
-          (grep -n "def make_advice" predict_and_advise.py || true)
-          ls -la
-
-      # === 列印檔案與片段，確認內容 ===
-      - name: List repo files and preview predict_and_advise.py
-        shell: bash
-        run: |
-          pwd
-          ls -la
-          echo "---- head of predict_and_advise.py ----"
-          sed -n '1,80p' predict_and_advise.py || true
-          echo "---- tail of predict_and_advise.py ----"
-          tail -n 40 predict_and_advise.py || true
-
-      # === 若沒有 make_advice，自動注入 shim（安全寫法，避免 YAML 解析問題） ===
-      - name: Self-heal: inject make_advice shim if missing
-        shell: bash
-        run: |
-          python - <<'PY' || true
-          import re, pathlib
-          p = pathlib.Path("predict_and_advise.py")
-          s = p.read_text(encoding="utf-8") if p.exists() else ""
-          if not re.search(r"\bdef\s+make_advice\s*\(", s):
-              print("inject shim into", p)
-              shim = (
-                  "\n"
-                  "# ---- CI shim: ensure make_advice exists ----\n"
-                  "def make_advice(record: dict, model_path: str = 'behavior_health_model.joblib'):\n"
-                  "    try:\n"
-                  "        if 'predict_and_advise' in globals():\n"
-                  "            pred, tips = predict_and_advise(record, model_path=model_path)\n"
-                  "            return {'advice': {'state': str(pred), 'tips': tips, 'model_version': 'shim', 'confidence': 0.6}}\n"
-                  "    except Exception:\n"
-                  "        pass\n"
-                  "    return {'advice': {'state': 'ok', 'tips': ['資料有限，維持規律作息、補水與輕量活動。', '(shim)'], 'model_version': 'shim-fallback', 'confidence': 0.3}}\n"
-                  "# ---- end shim ----\n"
-              )
-              p.write_text(s + shim, encoding='utf-8')
-          else:
-              print("make_advice already present")
-          PY
-
-      # === 模組自檢：確認 make_advice 存在且被載到 ===
-      - name: Sanity check predict_and_advise module
-        run: |
-          python - <<'PY'
-          import importlib, inspect, sys
-          m = importlib.import_module("predict_and_advise")
-          print("MODULE FILE =", m.__file__)
-          if not hasattr(m, "make_advice"):
-              print("FATAL: 'make_advice' not found in module"); sys.exit(2)
-          print("OK: make_advice found")
-          src = inspect.getsource(m.make_advice)
-          print("make_advice preview:\n", "\n".join(src.splitlines()[:8]))
-          PY
-
-      - name: Debug latest health_data
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
-        run: |
-          python - <<'PY'
-          from google.cloud import firestore
-          db = firestore.Client()
-          date_ids = sorted([d.id for d in db.collection('health_data').list_documents()])
-          print("Total dates:", len(date_ids))
-          print("Tail dates:", date_ids[-5:])
-          if date_ids:
-              latest_date = date_ids[-1]
-              rec_ids = sorted([r.id for r in db.collection('health_data').document(latest_date).collection('records').list_documents()])
-              print(f"Latest date = {latest_date}, records count = {len(rec_ids)}")
-              print("Tail times:", rec_ids[-10:])
-          else:
-              print("No health_data yet.")
-          PY
 
       - name: Unzip model if needed
         run: |
@@ -173,7 +78,39 @@ jobs:
             [ -f "$f" ] && echo "✅ $f found" || { echo "❌ MISSING: $f"; exit 1; }
           done
 
-      # ---------- 寫入前的兩個偵錯 ----------
+      - name: Check predict_and_advise has make_advice
+        run: |
+          python - <<'PY'
+          import importlib, sys, inspect
+          try:
+            m = importlib.import_module("predict_and_advise")
+          except Exception as e:
+            print("Import predict_and_advise failed:", e); sys.exit(2)
+          if not hasattr(m, "make_advice"):
+            print("FATAL: 'make_advice' not found in predict_and_advise.py"); sys.exit(2)
+          print("OK: make_advice found at", m.__file__)
+          print("Preview:", "\n".join(inspect.getsource(m.make_advice).splitlines()[:5]))
+          PY
+
+      - name: Debug latest health_data (dates & record ids)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+        run: |
+          python - <<'PY'
+          from google.cloud import firestore
+          db = firestore.Client()
+          date_ids = sorted([d.id for d in db.collection('health_data').list_documents()])
+          print("Total dates:", len(date_ids))
+          print("Tail dates:", date_ids[-5:])
+          if date_ids:
+              latest_date = date_ids[-1]
+              rec_ids = sorted([r.id for r in db.collection('health_data').document(latest_date).collection('records').list_documents()])
+              print(f"Latest date = {latest_date}, records count = {len(rec_ids)}")
+              print("Tail times:", rec_ids[-10:])
+          else:
+              print("No health_data yet.")
+          PY
+
       - name: Dump latest record (raw JSON)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
@@ -219,7 +156,6 @@ jobs:
           print("PAYLOAD-PREVIEW:", json.dumps(payload, ensure_ascii=False))
           PY
 
-      # ---------- 正式寫入（近 24h、不強制覆寫） ----------
       - name: Run advice writer (verbose, last 24h, no force)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
