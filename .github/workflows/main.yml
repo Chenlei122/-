@@ -120,12 +120,59 @@ jobs:
             [ -f "$f" ] && echo "✅ $f found" || { echo "❌ MISSING: $f"; exit 1; }
           done
 
-      - name: Run advice writer (force + verbose)
+      # ---------- 兩個偵錯步驟：在寫入之前 ----------
+      - name: Dump latest record (raw JSON)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+        run: |
+          python - <<'PY'
+          from google.cloud import firestore
+          db = firestore.Client()
+          root='health_data'
+          dates = sorted([d.id for d in db.collection(root).list_documents()])
+          if not dates:
+              print("No dates"); raise SystemExit(0)
+          latest_date = dates[-1]
+          recs = sorted([r.id for r in db.collection(root).document(latest_date).collection('records').list_documents()])
+          if not recs:
+              print("No records under", latest_date); raise SystemExit(0)
+          latest_time = recs[-1]
+          ref = db.collection(root).document(latest_date).collection('records').document(latest_time)
+          snap = ref.get()
+          print("PATH:", ref.path)
+          print("RAW:", snap.to_dict())
+          PY
+
+      - name: Dry-run advice on latest record (no write)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+        run: |
+          python - <<'PY'
+          from google.cloud import firestore
+          from predict_and_advise import make_advice
+          import json
+          db = firestore.Client()
+          root='health_data'
+          dates = sorted([d.id for d in db.collection(root).list_documents()])
+          if not dates: raise SystemExit("No dates")
+          latest_date = dates[-1]
+          recs = sorted([r.id for r in db.collection(root).document(latest_date).collection('records').list_documents()])
+          if not recs: raise SystemExit("No records")
+          latest_time = recs[-1]
+          ref = db.collection(root).document(latest_date).collection('records').document(latest_time)
+          data = ref.get().to_dict() or {}
+          payload = make_advice(data, model_path="behavior_health_model.joblib")
+          print("PATH:", ref.path)
+          print("PAYLOAD-PREVIEW:", json.dumps(payload, ensure_ascii=False))
+          PY
+
+      # ---------- 真正寫入（建議先用24小時視窗 & 不強制覆寫） ----------
+      - name: Run advice writer (verbose, last 24h, no force)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           PYTHONUNBUFFERED: "1"
         run: |
           python -u ./firestore_predict_writeback.py \
-            --key ./sa.json --root health_data --days 7 \
-            --force --verbose
-          echo "If wrote==0, schema mismatch or time-window empty."
+            --key ./sa.json --root health_data --since-hours 24 \
+            --verbose
+          echo "If wrote==0, likely no fresh docs or unusable features."
