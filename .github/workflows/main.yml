@@ -94,16 +94,16 @@ jobs:
         shell: bash
         run: |
           python - <<'PY' || true
-import re
-p = "predict_and_advise.py"
-try:
-    s = open(p, "r", encoding="utf-8").read()
-except FileNotFoundError:
-    s = ""
-if re.search(r"\bdef\s+make_advice\s*\(", s) is None:
-    print("inject shim into", p)
-    with open(p, "a", encoding="utf-8") as f:
-        f.write("""
+          import re
+          p = "predict_and_advise.py"
+          try:
+          s = open(p, "r", encoding="utf-8").read()
+          except FileNotFoundError:
+          s = ""
+          if re.search(r"\bdef\s+make_advice\s*\(", s) is None:
+          print("inject shim into", p)
+          with open(p, "a", encoding="utf-8") as f:
+            f.write("""
 
 # ---- CI shim: ensure make_advice exists ----
 def make_advice(record: dict, model_path: str = "behavior_health_model.joblib"):
@@ -118,9 +118,10 @@ def make_advice(record: dict, model_path: str = "behavior_health_model.joblib"):
                        "model_version": "shim-fallback", "confidence": 0.3}}
 # ---- end shim ----
 """)
-else:
-    print("make_advice already present")
-PY
+    else:
+        print("make_advice already present")
+    PY
+
 
       - name: Sanity check predict_and_advise module
         run: |
