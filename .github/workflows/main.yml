@@ -48,16 +48,13 @@ jobs:
           set -e
           sudo apt-get update -y && sudo apt-get install -y jq
           echo "Query latest release..."
-          LATEST=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
-                   https://api.github.com/repos/${{ github.repository }}/releases/latest)
+          LATEST=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/${{ github.repository }}/releases/latest)
           ASSET_URL=$(echo "$LATEST" | jq -r '.assets[] | select(.name=="behavior_health_model.zip") | .url')
           if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
             echo "No asset named behavior_health_model.zip in latest release."; exit 1
           fi
           echo "Downloading model asset..."
-          curl -L -H "Authorization: Bearer ${GH_TOKEN}" \
-               -H "Accept: application/octet-stream" \
-               "$ASSET_URL" -o behavior_health_model.zip
+          curl -L -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" "$ASSET_URL" -o behavior_health_model.zip
           ls -la
 
       # === 強制以 main 的原始檔覆蓋兩支腳本，避免舊檔殘留 ===
@@ -99,7 +96,7 @@ jobs:
       - name: Self-heal: inject make_advice shim if missing
         run: |
           python - <<'PY' || true
-          import re, sys
+          import re
           p = "predict_and_advise.py"
           try:
               s = open(p, "r", encoding="utf-8").read()
