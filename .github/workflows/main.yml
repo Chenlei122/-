@@ -60,7 +60,6 @@ jobs:
                "$ASSET_URL" -o behavior_health_model.zip
           ls -la
 
-      # === 強制以 main 的原始檔覆蓋兩支腳本，避免舊檔殘留 ===
       - name: Ensure scripts from repo (raw via API, force refresh)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -80,75 +79,21 @@ jobs:
           fetch_raw firestore_predict_writeback.py
           echo "SHA256 of predict_and_advise.py:"
           (sha256sum predict_and_advise.py || shasum -a 256 predict_and_advise.py) 2>/dev/null || true
-          echo "Preview first 200 lines:"
-          nl -ba predict_and_advise.py | sed -n '1,200p'
+          echo "Functions containing 'make_advice' in predict_and_advise.py:"
+          grep -n "def make_advice" predict_and_advise.py || true
+          ls -la
 
-      # === 先補上 make_advice（若模組缺少），再往下跑 ===
-      - name: Ensure make_advice exists (auto-patch if missing)
-        shell: bash
-        run: |
-          set -e
-          python - <<'PY' || PATCH=1
-import importlib, sys
-m = importlib.import_module("predict_and_advise")
-if not hasattr(m, "make_advice"):
-    sys.exit(1)
-print("make_advice OK")
-PY
-          if [ "${PATCH:-}" = "1" ]; then
-            echo "Patching predict_and_advise.py with a minimal make_advice shim..."
-            cat >> predict_and_advise.py <<'PY'
-
-# ---- CI-injected shim: ensure make_advice exists ----
-def make_advice(record: dict, model_path: str = "behavior_health_model.joblib"):
-    """
-    Minimal shim used by CI when the repository version lacks make_advice.
-    Tries predict_and_advise(record) if present; otherwise returns a safe fallback.
-    """
-    try:
-        if 'predict_and_advise' in globals():
-            pred, tips = predict_and_advise(record, model_path=model_path)
-            return {
-                "advice": {
-                    "state": str(pred),
-                    "tips": tips,
-                    "model_version": "shim",
-                    "confidence": 0.6
-                }
-            }
-    except Exception:
-        pass
-    return {
-        "advice": {
-            "state": "ok",
-            "tips": ["資料有限，維持規律作息、補水與輕量活動。", "(shim fallback)"],
-            "model_version": "shim-fallback",
-            "confidence": 0.3
-        }
-    }
-# ---- end shim ----
-PY
-            python - <<'PY'
-import importlib, inspect
-m = importlib.import_module("predict_and_advise")
-print("AFTER PATCH, MODULE FILE =", m.__file__)
-print("HAS make_advice:", hasattr(m, "make_advice"))
-print("make_advice head:\n", "\n".join(inspect.getsource(m.make_advice).splitlines()[:8]))
-PY
-          fi
-
-      # === 模組自檢（非致命）：確認載到的是對的檔案，且確實有 make_advice ===
       - name: Sanity check predict_and_advise module
-        continue-on-error: true
         run: |
           python - <<'PY'
-          import importlib, inspect
+          import importlib, inspect, sys
           m = importlib.import_module("predict_and_advise")
           print("MODULE FILE =", m.__file__)
-          print("HAS make_advice:", hasattr(m, "make_advice"))
-          if hasattr(m, "make_advice"):
-              src = inspect.getsource(m.make_advice)
-              print("make_advice preview:\n", "\n".join(src.splitlines()[:6]))
+          if not hasattr(m, "make_advice"):
+              print("FATAL: 'make_advice' not found in module"); sys.exit(2)
+          src = inspect.getsource(m.make_advice)
+          print("make_advice preview:")
+          print("\n".join(src.splitlines()[:6]))
           PY
 
       - name: Debug latest health_data
@@ -190,7 +135,6 @@ PY
             [ -f "$f" ] && echo "✅ $f found" || { echo "❌ MISSING: $f"; exit 1; }
           done
 
-      # ---------- 兩個偵錯步驟：在寫入之前 ----------
       - name: Dump latest record (raw JSON)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
@@ -236,7 +180,6 @@ PY
           print("PAYLOAD-PREVIEW:", json.dumps(payload, ensure_ascii=False))
           PY
 
-      # ---------- 正式寫入（建議先用 24 小時視窗 & 不強制覆寫） ----------
       - name: Run advice writer (verbose, last 24h, no force)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
