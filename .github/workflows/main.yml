@@ -34,7 +34,7 @@ jobs:
           import os, json, sys, pathlib
           raw = os.environ.get("SA_JSON")
           if not raw:
-            print("ERROR: Secret GOOGLE_APPLICATION_CREDENTIALS_JSON missing"); sys.exit(1)
+              print("ERROR: Secret GOOGLE_APPLICATION_CREDENTIALS_JSON missing"); sys.exit(1)
           data = json.loads(raw)
           assert data.get("type") == "service_account"
           pathlib.Path("sa.json").write_text(raw, encoding="utf-8")
@@ -90,7 +90,7 @@ jobs:
           echo "---- tail of predict_and_advise.py ----"
           tail -n 40 predict_and_advise.py || true
 
-            - name: Self-heal: inject make_advice shim if missing
+      - name: Self-heal: inject make_advice shim if missing
         shell: bash
         run: |
           python - <<'PY' || true
@@ -121,8 +121,6 @@ def make_advice(record: dict, model_path: str = "behavior_health_model.joblib"):
           else:
               print("make_advice already present")
           PY
-
-
 
       - name: Sanity check predict_and_advise module
         run: |
