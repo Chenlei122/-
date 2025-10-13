@@ -2,21 +2,20 @@ name: Firestore Advice Cron
 
 on:
   schedule:
-    - cron: "*/60 * * * *"   # 每 10 分鐘（UTC）
+    - cron: "*/10 * * * *"   # 每 10 分鐘（UTC）
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
+    env:
+      CODE_DIR: .github   # 你的程式都放在 .github 資料夾
     steps:
-      # 1) 固定把 repo checkout 到 ${GITHUB_WORKSPACE}/repo
-      - name: Checkout (force main to repo/)
+      - name: Checkout (force main)
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
-          path: repo
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -28,11 +27,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install firebase-admin google-cloud-firestore pandas joblib
 
+      # sa.json 寫在 repo 根目錄（非 .github/）
       - name: Write service account key
+        shell: bash
         env:
           SA_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
         run: |
-          set -euo pipefail
           python - <<'PY'
           import os, json, sys, pathlib
           raw = os.environ.get("SA_JSON")
@@ -40,15 +40,17 @@ jobs:
               print("ERROR: Secret GOOGLE_APPLICATION_CREDENTIALS_JSON missing"); sys.exit(1)
           data = json.loads(raw)
           assert data.get("type") == "service_account"
-          pathlib.Path("repo/sa.json").write_text(raw, encoding="utf-8")
+          pathlib.Path("sa.json").write_text(raw, encoding="utf-8")
           print("Wrote sa.json for project:", data.get("project_id"))
           PY
 
-      - name: Download model from latest release
+      # 下載最新 release 的模型，放在 .github/ 底下
+      - name: Download model from release
         env:
           GH_TOKEN: ${{ github.token }}
+        working-directory: ${{ env.CODE_DIR }}
         run: |
-          set -euo pipefail
+          set -e
           sudo apt-get update -y && sudo apt-get install -y jq
           echo "Query latest release..."
           LATEST=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -57,77 +59,71 @@ jobs:
           if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
             echo "No asset named behavior_health_model.zip in latest release."; exit 1
           fi
-          echo "Downloading model asset to repo/…"
-          curl -L -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" \
-               "$ASSET_URL" -o "repo/behavior_health_model.zip"
-          unzip -o "repo/behavior_health_model.zip" -d "repo" || true
+          echo "Downloading model asset into ${PWD}..."
+          curl -L -H "Authorization: Bearer ${GH_TOKEN}" \
+               -H "Accept: application/octet-stream" \
+               "$ASSET_URL" -o behavior_health_model.zip
+          ls -la
 
-      # 顯示實際檔案樹狀，之後所有步驟都用 ${REPO} 絕對路徑
+      #（可選）列出實際檔案與位置，方便確認路徑
       - name: Show workspace tree
-        env:
-          REPO: ${{ github.workspace }}/repo
         run: |
-          echo "GITHUB_WORKSPACE: ${GITHUB_WORKSPACE}"
-          echo "REPO path      : ${REPO}"
-          echo "--- repo tree ---"
-          find "${REPO}" -maxdepth 2 -type f -printf "%p\n" | sort
+          echo "Workspace: $GITHUB_WORKSPACE"
+          ls -la
+          echo "--- ${CODE_DIR} ---"
+          ls -la "${CODE_DIR}"
 
-      - name: Assert files exist (absolute paths)
-        env:
-          REPO: ${{ github.workspace }}/repo
+      # 若 joblib 不在，解壓 zip（.github/ 內）
+      - name: Unzip model if needed
+        working-directory: ${{ env.CODE_DIR }}
         run: |
-          set -euo pipefail
-          for f in \
-            "${REPO}/firestore_predict_writeback.py" \
-            "${REPO}/predict_and_advise.py" \
-            "${REPO}/sa.json"
-          do
-            if [ -f "$f" ]; then
-              echo "✅ found: $f"
-            else
-              echo "❌ MISSING: $f"; exit 1
-            fi
-          done
-          if [ -f "${REPO}/behavior_health_model.joblib" ] || [ -f "${REPO}/behavior_health_model.zip" ]; then
-            echo "✅ model present"
+          echo "Before unzip:"; ls -la
+          if [ -f behavior_health_model.joblib ]; then
+            echo "joblib already present."
+          elif [ -f behavior_health_model.zip ]; then
+            echo "Found zip, unzip to joblib..."
+            unzip -o behavior_health_model.zip
           else
-            echo "❌ MISSING: ${REPO}/behavior_health_model.joblib|.zip"; exit 1
+            echo "No model file (.joblib or .zip) found."; exit 1
           fi
+          echo "After unzip:"; ls -la
 
-      - name: Check predict_and_advise has make_advice
-        env:
-          PYTHONPATH: ${{ github.workspace }}/repo
+      # 確認兩支腳本、模型與 sa.json 都找得到（注意路徑）
+      - name: Assert files exist
+        shell: bash
         run: |
-          python - <<'PY'
-          import importlib, inspect, os
-          print("PYTHONPATH =", os.environ.get("PYTHONPATH"))
-          m = importlib.import_module("predict_and_advise")
-          print("MODULE FILE =", m.__file__)
-          assert hasattr(m, "make_advice"), "make_advice not found in predict_and_advise"
-          print("OK: make_advice present")
-          print("\n".join(inspect.getsource(m.make_advice).splitlines()[:6]))
-          PY
+          set -e
+          ROOT="$GITHUB_WORKSPACE"
+          CODE="${ROOT}/${CODE_DIR}"
+          for f in "${CODE}/firestore_predict_writeback.py" "${CODE}/predict_and_advise.py" "${CODE}/behavior_health_model.joblib" "${ROOT}/sa.json"; do
+            if [ -f "$f" ]; then echo "✅ $f"; else echo "❌ MISSING: $f"; exit 1; fi
+          done
 
-      - name: Debug latest health_data (dates & record ids)
+      # 讀 health_data（以 .github 為工作目錄；sa.json 指到根目錄）
+      - name: Debug latest health_data
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/repo/sa.json
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+        working-directory: ${{ env.CODE_DIR }}
         run: |
           python - <<'PY'
           from google.cloud import firestore
           db = firestore.Client()
-          dates = sorted([d.id for d in db.collection('health_data').list_documents()])
-          print("Total dates:", len(dates))
-          print("Tail dates:", dates[-5:])
-          if dates:
-            latest = dates[-1]
-            recs = sorted([r.id for r in db.collection('health_data').document(latest).collection('records').list_documents()])
-            print(f"Latest date = {latest}, records count = {len(recs)}")
-            print("Tail times:", recs[-10:])
+          date_ids = sorted([d.id for d in db.collection('health_data').list_documents()])
+          print("Total dates:", len(date_ids))
+          print("Tail dates:", date_ids[-5:])
+          if date_ids:
+              latest_date = date_ids[-1]
+              rec_ids = sorted([r.id for r in db.collection('health_data').document(latest_date).collection('records').list_documents()])
+              print(f"Latest date = {latest_date}, records count = {len(rec_ids)}")
+              print("Tail times:", rec_ids[-10:])
+          else:
+              print("No health_data yet.")
           PY
 
       - name: Dump latest record (raw JSON)
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/repo/sa.json
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+        working-directory: ${{ env.CODE_DIR }}
         run: |
           python - <<'PY'
           from google.cloud import firestore
@@ -149,14 +145,13 @@ jobs:
 
       - name: Dry-run advice on latest record (no write)
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/repo/sa.json
-          PYTHONPATH: ${{ github.workspace }}/repo
-          REPO: ${{ github.workspace }}/repo
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+        working-directory: ${{ env.CODE_DIR }}
         run: |
           python - <<'PY'
           from google.cloud import firestore
           from predict_and_advise import make_advice
-          import json, os
+          import json
           db = firestore.Client()
           root='health_data'
           dates = sorted([d.id for d in db.collection(root).list_documents()])
@@ -167,19 +162,19 @@ jobs:
           latest_time = recs[-1]
           ref = db.collection(root).document(latest_date).collection('records').document(latest_time)
           data = ref.get().to_dict() or {}
-          model_path = os.path.join(os.environ["REPO"], "behavior_health_model.joblib")
-          payload = make_advice(data, model_path=model_path)
+          payload = make_advice(data, model_path="behavior_health_model.joblib")
           print("PATH:", ref.path)
           print("PAYLOAD-PREVIEW:", json.dumps(payload, ensure_ascii=False))
           PY
 
+      # 正式寫入：以 .github 為工作目錄，--key 指向 ../sa.json
       - name: Run advice writer (verbose, last 24h, no force)
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/repo/sa.json
-          REPO: ${{ github.workspace }}/repo
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+          PYTHONUNBUFFERED: "1"
+        working-directory: ${{ env.CODE_DIR }}
         run: |
-          python -u "${REPO}/firestore_predict_writeback.py" \
-            --key "${REPO}/sa.json" \
-            --root health_data \
-            --since-hours 24 \
+          python -u ./firestore_predict_writeback.py \
+            --key ../sa.json --root health_data --since-hours 24 \
             --verbose
+          echo "If wrote==0, likely no fresh docs or unusable features."
