@@ -10,11 +10,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout (force main)
+      # 1) 固定把 repo checkout 到 ${GITHUB_WORKSPACE}/repo
+      - name: Checkout (force main to repo/)
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
+          path: repo
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -38,11 +40,11 @@ jobs:
               print("ERROR: Secret GOOGLE_APPLICATION_CREDENTIALS_JSON missing"); sys.exit(1)
           data = json.loads(raw)
           assert data.get("type") == "service_account"
-          pathlib.Path("sa.json").write_text(raw, encoding="utf-8")
+          pathlib.Path("repo/sa.json").write_text(raw, encoding="utf-8")
           print("Wrote sa.json for project:", data.get("project_id"))
           PY
 
-      - name: Download model from release
+      - name: Download model from latest release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -55,26 +57,30 @@ jobs:
           if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
             echo "No asset named behavior_health_model.zip in latest release."; exit 1
           fi
-          echo "Downloading model asset..."
-          curl -L -H "Authorization: Bearer ${GH_TOKEN}" \
-               -H "Accept: application/octet-stream" "$ASSET_URL" \
-               -o "${GITHUB_WORKSPACE}/behavior_health_model.zip"
-          unzip -o "${GITHUB_WORKSPACE}/behavior_health_model.zip" -d "${GITHUB_WORKSPACE}" || true
+          echo "Downloading model asset to repo/…"
+          curl -L -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" \
+               "$ASSET_URL" -o "repo/behavior_health_model.zip"
+          unzip -o "repo/behavior_health_model.zip" -d "repo" || true
 
-      - name: Show workspace tree (depth 3)
+      # 顯示實際檔案樹狀，之後所有步驟都用 ${REPO} 絕對路徑
+      - name: Show workspace tree
+        env:
+          REPO: ${{ github.workspace }}/repo
         run: |
-          echo "PWD            = $(pwd)"
-          echo "GITHUB_WORKSPACE = ${GITHUB_WORKSPACE}"
-          echo "--- tree (depth 3) ---"
-          find "${GITHUB_WORKSPACE}" -maxdepth 3 -type f -printf "%p\n" | sort
+          echo "GITHUB_WORKSPACE: ${GITHUB_WORKSPACE}"
+          echo "REPO path      : ${REPO}"
+          echo "--- repo tree ---"
+          find "${REPO}" -maxdepth 2 -type f -printf "%p\n" | sort
 
       - name: Assert files exist (absolute paths)
+        env:
+          REPO: ${{ github.workspace }}/repo
         run: |
           set -euo pipefail
           for f in \
-            "${GITHUB_WORKSPACE}/firestore_predict_writeback.py" \
-            "${GITHUB_WORKSPACE}/predict_and_advise.py" \
-            "${GITHUB_WORKSPACE}/sa.json"
+            "${REPO}/firestore_predict_writeback.py" \
+            "${REPO}/predict_and_advise.py" \
+            "${REPO}/sa.json"
           do
             if [ -f "$f" ]; then
               echo "✅ found: $f"
@@ -82,16 +88,15 @@ jobs:
               echo "❌ MISSING: $f"; exit 1
             fi
           done
-          # 模型可用：zip 或 joblib 其一存在即可（上一步已解壓到 workspace）
-          if [ -f "${GITHUB_WORKSPACE}/behavior_health_model.joblib" ] || [ -f "${GITHUB_WORKSPACE}/behavior_health_model.zip" ]; then
+          if [ -f "${REPO}/behavior_health_model.joblib" ] || [ -f "${REPO}/behavior_health_model.zip" ]; then
             echo "✅ model present"
           else
-            echo "❌ MISSING: behavior_health_model.joblib|.zip"; exit 1
+            echo "❌ MISSING: ${REPO}/behavior_health_model.joblib|.zip"; exit 1
           fi
 
       - name: Check predict_and_advise has make_advice
         env:
-          PYTHONPATH: ${{ github.workspace }}
+          PYTHONPATH: ${{ github.workspace }}/repo
         run: |
           python - <<'PY'
           import importlib, inspect, os
@@ -105,8 +110,7 @@ jobs:
 
       - name: Debug latest health_data (dates & record ids)
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
-          PYTHONPATH: ${{ github.workspace }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/repo/sa.json
         run: |
           python - <<'PY'
           from google.cloud import firestore
@@ -123,7 +127,7 @@ jobs:
 
       - name: Dump latest record (raw JSON)
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/repo/sa.json
         run: |
           python - <<'PY'
           from google.cloud import firestore
@@ -145,13 +149,14 @@ jobs:
 
       - name: Dry-run advice on latest record (no write)
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
-          PYTHONPATH: ${{ github.workspace }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/repo/sa.json
+          PYTHONPATH: ${{ github.workspace }}/repo
+          REPO: ${{ github.workspace }}/repo
         run: |
           python - <<'PY'
           from google.cloud import firestore
           from predict_and_advise import make_advice
-          import json
+          import json, os
           db = firestore.Client()
           root='health_data'
           dates = sorted([d.id for d in db.collection(root).list_documents()])
@@ -162,17 +167,19 @@ jobs:
           latest_time = recs[-1]
           ref = db.collection(root).document(latest_date).collection('records').document(latest_time)
           data = ref.get().to_dict() or {}
-          payload = make_advice(data, model_path="${GITHUB_WORKSPACE}/behavior_health_model.joblib")
+          model_path = os.path.join(os.environ["REPO"], "behavior_health_model.joblib")
+          payload = make_advice(data, model_path=model_path)
           print("PATH:", ref.path)
           print("PAYLOAD-PREVIEW:", json.dumps(payload, ensure_ascii=False))
           PY
 
       - name: Run advice writer (verbose, last 24h, no force)
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/repo/sa.json
+          REPO: ${{ github.workspace }}/repo
         run: |
-          python -u "${GITHUB_WORKSPACE}/firestore_predict_writeback.py" \
-            --key "${GITHUB_WORKSPACE}/sa.json" \
+          python -u "${REPO}/firestore_predict_writeback.py" \
+            --key "${REPO}/sa.json" \
             --root health_data \
             --since-hours 24 \
             --verbose
