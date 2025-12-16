@@ -2,7 +2,7 @@ name: Firestore Advice Cron
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # 每 10 分鐘（UTC）
+    - cron: "*/30 * * * *"   # 每 30 分鐘（UTC）
   workflow_dispatch:
 
 jobs:
