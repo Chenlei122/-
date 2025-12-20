@@ -2,16 +2,16 @@ name: Firestore Advice Cron (Production)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # 每 30 分鐘執行一次
-  workflow_dispatch:         # 允許手動觸發
+    - cron: "*/30 * * * *"    # 每 30 分鐘執行一次
+  workflow_dispatch:          # 允許手動觸發
 
 jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      CODE_DIR: .github    # 你的程式碼目錄
+      CODE_DIR: .github     # 你的程式碼目錄
     steps:
-      # 1. 快速下載程式碼 (只抓最新版，不抓歷史紀錄)
+      # 1. 快速下載程式碼
       - name: Checkout (shallow)
         uses: actions/checkout@v4
         with:
@@ -25,19 +25,18 @@ jobs:
           python-version: "3.11"
 
       # 3. 快取 Python 套件 (加速關鍵！⚡)
-      # 透過這步，第二次執行時 pip install 幾乎瞬間完成
       - name: Cache Pip packages
         uses: actions/cache@v4
         id: cache-pip
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-firestore-v1
+          key: ${{ runner.os }}-pip-firestore-v2  # 改個名讓快取更新
 
-      # 4. 安裝套件
+      # 4. 安裝套件 (這裡加上了 tqdm)
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install firebase-admin google-cloud-firestore pandas joblib
+          pip install firebase-admin google-cloud-firestore pandas joblib tqdm
 
       # 5. 寫入金鑰 (SA_JSON)
       - name: Write service account key
@@ -63,7 +62,6 @@ jobs:
           set -e
           sudo apt-get update -y && sudo apt-get install -y jq
           
-          # 檢查是否已有解壓好的模型 (理論上 GitHub Action 每次是乾淨環境，但為了保險)
           if [ -f "behavior_health_model.joblib" ]; then echo "✅ Model already exists."; exit 0; fi
 
           echo "🔍 Querying latest release..."
@@ -84,9 +82,7 @@ jobs:
           unzip -o behavior_health_model.zip
           ls -la behavior_health_model.joblib
 
-      # 7. 正式執行 (正式模式)
-      # --days 3: 只往回看 3 天 (因為舊資料我們已經補齊了)
-      # 由於有增量檢查邏輯，它會自動跳過已處理的資料，速度極快
+      # 7. 正式執行
       - name: Run Production Advice Writer
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
