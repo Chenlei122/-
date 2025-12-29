@@ -2,7 +2,7 @@ name: Firestore Advice Cron (Production)
 
 on:
   schedule:
-    - cron: "/30 * * * *"    # 每 30 分鐘執行一次
+    - cron: "*/30 * * * *"    # 每 30 分鐘執行一次
   workflow_dispatch:          # 允許手動觸發
 
 jobs:
