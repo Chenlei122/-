@@ -154,4 +154,5 @@ def main():
     print(f"✅ 任務完成！共新增 {total_added} 筆建議。")
 
 if __name__ == "__main__":
+
     main()
